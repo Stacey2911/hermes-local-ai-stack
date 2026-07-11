@@ -1,0 +1,44 @@
+# Hermes project-context files (local orchestration only)
+AGENTS.md
+PROJECT.md
+PATHS.md
+SAFETY.md
+ACTIVE_WORKFLOW.md
+CURRENT_STATE.md
+HISTORY.md
+
+# Environment and secrets
+.env
+.env.*
+*.key
+*.pem
+*.secret
+secrets/
+private/
+scratch/
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.eggs/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Hermes local artifacts
+.hermes/local/
+.local-context/
+cron/output/
+audio_cache/
+voice-memos/

@@ -1,0 +1,303 @@
+{# Caduceus v1.7 best-effort companion template for Qwen3.6 + LM Studio.
+
+   THIRD-PARTY ADAPTATION NOTICE: This file was adapted and modified from the
+   official Qwen3.6 chat template and adapts Froggeric's Apache-2.0 JSON
+   tool-call option and reasoning/tool-boundary contract. See ../../THIRD_PARTY_NOTICES.md and
+   ../../LICENSE for provenance, attribution, and license terms.
+
+   This template has one tool protocol: the JSON-shaped tool-call dialect
+   parsed by the target HermesAgent + LM Studio + Qwen3.6 stack. The template
+   serializes request-time schemas, structured historical calls, and existing
+   plain tool responses. It cannot inspect or enforce where newly
+   generated tokens are placed. It complements HermesAgent workflows without
+   introducing Hermes-specific markers, runtime retries or repair, or a hard
+   HermesAgent dependency.
+
+   Independent model-feature controls:
+   - enable_thinking (default true): open or pre-close current-turn thinking.
+   - preserve_thinking (default true): replay supplied sanitized reasoning.
+
+   Exact-boundary sanitization neutralizes supplied-message tool and ChatML
+   boundary sequences without parsing or deleting ordinary JSON.
+ #}
+{%- set template_version = "qwen3.6-caduceus-v1.7" %}
+{%- set enable_thinking = enable_thinking if enable_thinking is defined else true %}
+{%- set preserve_thinking = preserve_thinking if preserve_thinking is defined else true %}
+{%- set max_tool_arg_chars = max_tool_arg_chars if max_tool_arg_chars is defined else 8000 %}
+{%- set max_tool_response_chars = max_tool_response_chars if max_tool_response_chars is defined else 16000 %}
+{%- set add_vision_id = add_vision_id if add_vision_id is defined else false %}
+{%- set reasoning_boundary_contract = 'Reasoning-boundary contract:\n- Planning and deliberation belong inside the active <think></think> block.\n- Once a conclusion or next action is determined, you MUST close the block exactly once. Do not keep reconsidering or repeating an already settled conclusion.\n- After closing, immediately produce either the visible final response or the required function call.\n- A visible final response may explain the result, but it must not continue private planning or reopen thinking.' %}
+{%- set thinking_tool_generation_contract = 'Thinking-enabled tool-generation discipline:\n- Do not predict, simulate, decode, expand, or quote expected tool output before executing the tool.\n- Compute only information required to choose a tool and construct its arguments; calculation needed for that purpose is permitted.\n- When supplied text, code, or arguments contain protocol-shaped delimiters, refer to them abstractly during reasoning rather than reproducing their literal spelling.\n- Inside reasoning, never reproduce literal tool-call, tool-result, thinking, or ChatML boundary sequences as data.\n- The only generated protocol boundaries are the single real thinking closure and the actual JSON-shaped tool_call envelope after reasoning closes.\n- Once the call and its arguments are determined, close reasoning promptly and call the tool.' %}
+{%- set tool_call_contract = 'Tool-call contract:\n- Tool calls MUST use the JSON-shaped <tool_call> dialect shown below.\n- Planning MUST remain inside <think></think>, and the block MUST close exactly once before any call.\n- Function-call-shaped syntax MUST NOT appear inside <think></think>.\n- If a tool is chosen, emit <tool_call> immediately after </think>, with no narration or conversational text between them.\n- <tool_call> MUST begin at the start of a new line with no indentation.\n- Its content MUST be one JSON object with exactly the keys "name" and "arguments".\n- "name" MUST be a non-empty string, and "arguments" MUST be a JSON object.\n- For multiple calls, emit a separate, fully closed <tool_call>...</tool_call> block for each function. Do not nest call blocks.\n- Use only functions listed in <tools> and include every required parameter.\n- Emit no suffix after the final function call.\n- If no tool is needed, close thinking and provide the visible final response without a tool call.' %}
+{%- set image_count = namespace(value=0) %}
+{%- set video_count = namespace(value=0) %}
+
+{%- if max_tool_arg_chars < 0 %}
+    {{- raise_exception('max_tool_arg_chars must be zero or greater.') }}
+{%- endif %}
+{%- if max_tool_response_chars < 0 %}
+    {{- raise_exception('max_tool_response_chars must be zero or greater.') }}
+{%- endif %}
+{%- if not messages %}
+    {{- raise_exception('No messages provided.') }}
+{%- endif %}
+{%- if messages is string or messages is mapping or messages is not iterable %}
+    {{- raise_exception('messages must be a non-string iterable of message mappings.') }}
+{%- endif %}
+{%- if tools is defined and tools and (tools is mapping or tools is string or tools is not iterable) %}
+    {{- raise_exception('tools must be a non-string iterable of tool schemas.') }}
+{%- endif %}
+{%- set has_tools = tools is defined and tools and tools is iterable and tools is not mapping and tools is not string %}
+
+{%- macro render_content(content, do_vision_count, is_system_content=false) %}
+    {%- if content is string %}
+        {{- content }}
+    {%- elif content is iterable and content is not mapping and content is not string %}
+        {#- Iterable type: non-string, non-mapping content-block sequence. -#}
+        {%- for item in content %}
+            {%- if item is mapping %}
+                {%- if item.type == 'image' or 'image' in item or 'image_url' in item %}
+                    {%- if is_system_content %}
+                        {{- raise_exception('System message cannot contain images.') }}
+                    {%- endif %}
+                    {%- if do_vision_count %}
+                        {%- set image_count.value = image_count.value + 1 %}
+                    {%- endif %}
+                    {%- if add_vision_id %}
+                        {{- 'Picture ' ~ image_count.value ~ ': ' }}
+                    {%- endif %}
+                    {{- '<|vision_start|><|image_pad|><|vision_end|>' }}
+                {%- elif item.type == 'video' or 'video' in item or 'video_url' in item %}
+                    {%- if is_system_content %}
+                        {{- raise_exception('System message cannot contain videos.') }}
+                    {%- endif %}
+                    {%- if do_vision_count %}
+                        {%- set video_count.value = video_count.value + 1 %}
+                    {%- endif %}
+                    {%- if add_vision_id %}
+                        {{- 'Video ' ~ video_count.value ~ ': ' }}
+                    {%- endif %}
+                    {{- '<|vision_start|><|video_pad|><|vision_end|>' }}
+                {%- elif 'text' in item %}
+                    {{- item.text }}
+                {%- else %}
+                    {{- raise_exception('Unexpected item type in content.') }}
+                {%- endif %}
+            {%- else %}
+                {{- item | string }}
+            {%- endif %}
+        {%- endfor %}
+    {%- elif content is none or content is undefined %}
+        {{- '' }}
+    {%- else %}
+        {{- raise_exception('Unexpected content type.') }}
+    {%- endif %}
+{%- endmacro %}
+
+{%- macro sanitize_supplied_content(text) -%}
+    {%- set legacy_request_start = '[' ~ 'TOOL_REQUEST' ~ ']' %}
+    {%- set legacy_request_end = '[' ~ 'END_TOOL_REQUEST' ~ ']' %}
+    {%- set legacy_result_start = '[' ~ 'TOOL_RESULT' ~ ']' %}
+    {%- set legacy_result_end = '[' ~ 'END_TOOL_RESULT' ~ ']' %}
+    {%- set value = text | string %}
+    {%- set value = value.split('<tool_call>') | join('&lt;tool_call&gt;') %}
+    {%- set value = value.split('</tool_call>') | join('&lt;/tool_call&gt;') %}
+    {%- set value = value.split('<function=') | join('&lt;function=') %}
+    {%- set value = value.split('</function>') | join('&lt;/function&gt;') %}
+    {%- set value = value.split('<parameter=') | join('&lt;parameter=') %}
+    {%- set value = value.split('</parameter>') | join('&lt;/parameter&gt;') %}
+    {%- set value = value.split('<tool_response>') | join('&lt;tool_response&gt;') %}
+    {%- set value = value.split('</tool_response>') | join('&lt;/tool_response&gt;') %}
+    {%- set value = value.split('<think>') | join('&lt;think&gt;') %}
+    {%- set value = value.split('</think>') | join('&lt;/think&gt;') %}
+    {%- set value = value.split('<|im_start|>') | join('&lt;|im_start|&gt;') %}
+    {%- set value = value.split('<|im_end|>') | join('&lt;|im_end|&gt;') %}
+    {%- set value = value.split(legacy_request_start) | join('TOOL_REQUEST') %}
+    {%- set value = value.split(legacy_request_end) | join('END_TOOL_REQUEST') %}
+    {%- set value = value.split(legacy_result_start) | join('TOOL_RESULT') %}
+    {%- set value = value.split(legacy_result_end) | join('END_TOOL_RESULT') %}
+    {{- value }}
+{%- endmacro %}
+
+{%- macro sanitize_tool_result(text) -%}
+    {{- sanitize_supplied_content(text) }}
+{%- endmacro %}
+
+{%- macro render_json_argument_value(value) -%}
+    {%- if value is string %}
+        {%- if max_tool_arg_chars > 0 and value | length > max_tool_arg_chars %}
+            {{- (value[:max_tool_arg_chars] + '\n[TRUNCATED: original length ' ~ (value | length | string) ~ ' chars]') | tojson }}
+        {%- else %}
+            {{- value | tojson }}
+        {%- endif %}
+    {%- else %}
+        {{- value | tojson }}
+    {%- endif %}
+{%- endmacro %}
+
+{%- macro render_serialized_arguments(value) -%}
+    {%- set safe_value = value | string %}
+    {%- set original_length = safe_value | length %}
+    {%- if max_tool_arg_chars > 0 and original_length > max_tool_arg_chars %}
+        {{- raise_exception('Historical serialized tool_call.arguments exceeds max_tool_arg_chars and cannot be safely truncated without JSON parsing.') }}
+    {%- endif %}
+    {#- Non-iterating compatibility path: preserve valid JSON while neutralizing every angle boundary. -#}
+    {%- set json_escape_prefix = '\\' %}
+    {%- set safe_value = safe_value.split('<') | join(json_escape_prefix + 'u003c') %}
+    {%- set safe_value = safe_value.split('>') | join(json_escape_prefix + 'u003e') %}
+    {{- safe_value }}
+{%- endmacro %}
+
+{%- macro require_json_identifier(value, label) -%}
+    {%- if value is not string or not value %}
+        {{- raise_exception(label + ' must be a non-empty string.') }}
+    {%- endif %}
+{%- endmacro %}
+
+{# Merge all consecutive leading system/developer messages. #}
+{%- set sys = namespace(count=0, content='', leading=true) %}
+{#- Iterable type: validated non-string messages sequence. -#}
+{%- for message in messages %}
+    {%- if sys.leading and (message.role == 'system' or message.role == 'developer') %}
+        {%- set rendered_system = sanitize_supplied_content(render_content(message.content, false, true)) | trim %}
+        {%- if sys.content and rendered_system %}
+            {%- set sys.content = sys.content + '\n' + rendered_system %}
+        {%- elif rendered_system %}
+            {%- set sys.content = rendered_system %}
+        {%- endif %}
+        {%- set sys.count = sys.count + 1 %}
+    {%- else %}
+        {%- set sys.leading = false %}
+    {%- endif %}
+{%- endfor %}
+
+{%- if has_tools %}
+    {{- '<|im_start|>system\n' }}
+    {{- '# Tools\n\nYou have access to the following functions:\n\n<tools>' }}
+    {#- Iterable type: validated non-string, non-mapping tool-schema sequence. -#}
+    {%- for tool in tools %}
+        {{- '\n' }}
+        {{- tool | tojson }}
+    {%- endfor %}
+    {{- '\n</tools>' }}
+    {%- if enable_thinking %}
+        {{- '\n\n' + reasoning_boundary_contract + '\n\n' + thinking_tool_generation_contract }}
+    {%- endif %}
+    {{- '\n\n' + tool_call_contract + '\n\nOrdered thinking-to-tool example:\n\n' }}
+    {{- '<think>\nbrief planning\n</think>\n<tool_call>\n{"name":"example_function_name","arguments":{"example_parameter":"value"}}\n</tool_call>' }}
+    {%- if sys.content %}
+        {{- '\n\n' + sys.content }}
+    {%- endif %}
+    {{- '<|im_end|>\n' }}
+{%- elif enable_thinking %}
+    {{- '<|im_start|>system\n' + reasoning_boundary_contract }}
+    {%- if sys.content %}
+        {{- '\n\n' + sys.content }}
+    {%- endif %}
+    {{- '<|im_end|>\n' }}
+{%- elif sys.content %}
+    {{- '<|im_start|>system\n' + sys.content + '<|im_end|>\n' }}
+{%- endif %}
+
+{%- set history = namespace(prev_role='') %}
+{#- Iterable type: validated non-string messages sequence. -#}
+{%- for message in messages %}
+    {%- if loop.index0 >= sys.count %}
+        {%- set is_system = message.role == 'system' or message.role == 'developer' %}
+        {%- set content = render_content(message.content, true, is_system) | trim %}
+        {%- if message.role != 'tool' %}
+            {%- set content = sanitize_supplied_content(content) | trim %}
+        {%- endif %}
+        {%- if is_system %}
+            {{- '<|im_start|>system\n' + content + '<|im_end|>\n' }}
+        {%- elif message.role == 'user' %}
+            {{- '<|im_start|>user\n' + content + '<|im_end|>\n' }}
+        {%- elif message.role == 'assistant' %}
+            {%- set reasoning_content = '' %}
+            {%- if message.reasoning_content is defined and message.reasoning_content is not none %}
+                {%- set reasoning_content = message.reasoning_content | string %}
+            {%- elif message.thinking is defined and message.thinking is not none %}
+                {%- set reasoning_content = message.thinking | string %}
+            {%- endif %}
+            {%- set reasoning_content = reasoning_content | trim %}
+            {%- if preserve_thinking and reasoning_content %}
+                {%- set reasoning_content = sanitize_supplied_content(reasoning_content) | trim %}
+            {%- endif %}
+            {%- set show_reasoning = preserve_thinking and reasoning_content %}
+            {%- if show_reasoning %}
+                {{- '<|im_start|>assistant\n<think>\n' + reasoning_content + '\n</think>\n\n' + content }}
+            {%- else %}
+                {{- '<|im_start|>assistant\n' + content }}
+            {%- endif %}
+            {%- if message.tool_calls is defined and message.tool_calls %}
+                {%- if message.tool_calls is mapping or message.tool_calls is string or message.tool_calls is not iterable %}
+                    {{- raise_exception('assistant tool_calls must be a non-string iterable.') }}
+                {%- endif %}
+                {#- Iterable type: validated non-string assistant tool-call sequence. -#}
+                {%- for tool_call in message.tool_calls %}
+                    {%- if tool_call.function is defined and tool_call.function is not none %}
+                        {%- set tc = tool_call.function %}
+                    {%- else %}
+                        {%- set tc = tool_call %}
+                    {%- endif %}
+                    {%- if tc.name is not defined or not tc.name %}
+                        {{- raise_exception('Historical tool call is missing a function name.') }}
+                    {%- endif %}
+                    {%- set validated_function_name = require_json_identifier(tc.name, 'Historical tool function name') %}
+                    {%- if not loop.first or content %}
+                        {{- '\n\n' }}
+                    {%- endif %}
+                    {{- '<tool_call>\n{"name":' }}
+                    {{- tc.name | tojson }}
+                    {{- ',"arguments":' }}
+                    {%- if tc.arguments is defined %}
+                        {%- if tc.arguments is mapping %}
+                        {#- Iterable type: mapping items view; never a serialized argument string. -#}
+                            {{- '{' }}
+                        {%- for argument_name, argument_value in tc.arguments.items() %}
+                            {%- set validated_argument_name = require_json_identifier(argument_name, 'Historical tool argument key') %}
+                            {%- if not loop.first %}{{- ',' }}{%- endif %}
+                            {{- argument_name | tojson }}
+                            {{- ':' }}
+                            {{- render_json_argument_value(argument_value) }}
+                        {%- endfor %}
+                            {{- '}' }}
+                        {%- elif tc.arguments is string and tc.arguments %}
+                            {{- render_serialized_arguments(tc.arguments) }}
+                        {%- else %}
+                            {{- raise_exception('Historical tool_call.arguments must be a mapping or a non-empty serialized JSON string.') }}
+                        {%- endif %}
+                    {%- else %}
+                        {{- '{}' }}
+                    {%- endif %}
+                    {{- '}\n</tool_call>' }}
+                {%- endfor %}
+            {%- endif %}
+            {{- '<|im_end|>\n' }}
+        {%- elif message.role == 'tool' %}
+            {%- if history.prev_role != 'tool' %}
+                {{- '<|im_start|>user' }}
+            {%- endif %}
+            {%- if max_tool_response_chars > 0 and content | length > max_tool_response_chars %}
+                {%- set content = content[:max_tool_response_chars] + '\n[TRUNCATED: original length ' ~ (content | length | string) ~ ' chars]' %}
+            {%- endif %}
+            {%- set content = sanitize_tool_result(content) %}
+            {{- '\n<tool_response>\n' + content + '\n</tool_response>' }}
+            {%- if loop.last or messages[loop.index0 + 1].role != 'tool' %}
+                {{- '<|im_end|>\n' }}
+            {%- endif %}
+        {%- else %}
+            {{- raise_exception('Unexpected message role: ' + (message.role | string)) }}
+        {%- endif %}
+        {%- set history.prev_role = message.role %}
+    {%- endif %}
+{%- endfor %}
+
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+    {%- if enable_thinking %}
+        {{- '<think>\n' }}
+    {%- else %}
+        {{- '<think>\n\n</think>\n\n' }}
+    {%- endif %}
+{%- endif -%}
