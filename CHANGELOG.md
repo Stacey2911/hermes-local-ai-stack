@@ -1,16 +1,23 @@
 # Changelog
 
-## v1.7 — initial supported baseline
+User-visible changes are grouped by product so skills, chat templates, bundles, and utilities can share one repository history.
 
-### Added
+## Caduceus v1.8
 
-- Supplied tool schemas serialized as JSON inside the tools section, and historical tool calls replayed in JSON-shaped `&lt;tool_call&gt;` envelopes, with the existing plain tool-result wrapper.
-- Independent `enable_thinking` and `preserve_thinking` controls, both enabled by default.
-- Exact-boundary sanitization for supplied user, system/developer, assistant, reasoning, and tool-result content.
-- Mapping and serialized-string historical argument handling, including fail-closed over-limit serialized containers.
-- Deterministic rendering tests and boundary-replay coverage.
+- Carries the current task across follow-up messages while keeping earlier completed work distinct.
+- Grounds completion language in tool results returned for the active objective.
+- Groups independent actions with known arguments into adjacent multi-action batches.
+- Keeps dependent, conflicting, shared-state, and overlapping-resource actions sequential.
+- Reuses equivalent calls and keeps repeated actions tied to changed inputs or outcomes.
+- Reports mixed action outcomes individually and accurately.
+- Allows brief visible narration before the first thinking-enabled call while keeping adjacent calls contiguous.
+- Defaults `preserve_thinking` to `false` for caller-supplied historical reasoning.
 
-### Limitations
+## Caduceus v1.7
 
-- Current-generation boundary placement is system guidance; the Jinja template cannot rewrite generated output.
-- The template adds no runtime retry, response repair, parser salvage, or automatic thinking change.
+- Renders one JSON-shaped payload for each structured tool call.
+- Replays historical calls and results in their original order with positional association.
+- Neutralizes protocol-shaped supplied history at exact boundaries while preserving ordinary prose and JSON.
+- Provides independent controls for current-turn thinking and supplied historical reasoning.
+- Defaults `preserve_thinking` to `true`.
+- Bounds mapped string arguments and tool-result text with configurable size controls.
